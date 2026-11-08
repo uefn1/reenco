@@ -1,1 +1,1 @@
-# v7: crf_mode 追加\n# custom=指定CRF / same=元のCRFと同じにする (検出できなければ hevc22/av1 30/h264 22)\n# 元のCRFは x265/x264 の埋め込み設定 crf= から検出\n
+# v9: 音声は常に copy (Opusのまま、AACに変換しない) mkvもmp4も同じ\n
