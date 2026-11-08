@@ -1,26 +1,20 @@
 #!/usr/bin/env bash
-# 単体エンコード - キーフレーム増加なし版
-# 元動画のキーフレーム位置をそのまま引き継ぐ。scenecut無効 + force_key_frames で自動挿入を防ぐ
 set -euo pipefail
 INPUT="$1"; OUTPUT="$2"; CODEC="${3:-hevc}"; CRF="${4:-22}"; PRESET="${5:-slow}"
 NPROC=$(nproc)
 echo "Input:$INPUT Output:$OUTPUT Codec:$CODEC CRF:$CRF Preset:$PRESET CPU:$NPROC"
-
-# 元のキーフレーム時刻リストを取得 (例: 0,2.0,4.5,7.1,...)
 FORCE=$(python3 scripts/get_keyframes.py "$INPUT" 0 999999 || echo "")
 if [ -n "$FORCE" ]; then
-  echo "Preserve keyframes: $(echo "$FORCE" | tr ',' '\n' | wc -l) keyframes, first 5: $(echo "$FORCE" | cut -d, -f1-5)"
+  echo "Preserve keyframes: $(echo "$FORCE" | tr ',' '\n' | wc -l) keyframes"
   FORCE_OPT="-force_key_frames $FORCE"
-  # keyint を大きくして自動挿入を防ぐ。scenecut=0 でシーン検出による追加も防ぐ
   GOP_OPT="-g 10000 -keyint_min 10000 -sc_threshold 0"
   X265_EXTRA="keyint=10000:min-keyint=10000:scenecut=0:open-gop=0"
 else
-  echo "No keyframe info -> fallback to fixed GOP 250 scenecut=0"
+  echo "No keyframe info -> fallback fixed GOP 250"
   FORCE_OPT=""
   GOP_OPT="-g 250 -keyint_min 250 -sc_threshold 0"
   X265_EXTRA="keyint=250:min-keyint=250:scenecut=0:open-gop=0"
 fi
-
 case "$CODEC" in
   hevc)
     ffmpeg -y -hwaccel auto -threads 0 -i "$INPUT" -map 0:v:0 -map 0:a? -map 0:s? -map_chapters 0 $GOP_OPT $FORCE_OPT -c:v libx265 -preset "$PRESET" -crf "$CRF" -pix_fmt yuv420p10le -tag:v hvc1 -x265-params "log-level=error:pools=$NPROC:frame-threads=$NPROC:$X265_EXTRA" -c:a aac -b:a 160k -ac 2 -c:s copy -movflags +faststart "$OUTPUT"
