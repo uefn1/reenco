@@ -1,2 +1,1 @@
-# v4 fixed: packetでキーフレームを高速取得
-frameだと全デコードで止まるように見える。packetなら数秒。
+# v7: crf_mode 追加\n# custom=指定CRF / same=元のCRFと同じにする (検出できなければ hevc22/av1 30/h264 22)\n# 元のCRFは x265/x264 の埋め込み設定 crf= から検出\n
