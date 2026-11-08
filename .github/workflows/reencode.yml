@@ -86,8 +86,8 @@ jobs:
           ls -lh work/
           echo "INPUT_FILE=work/input_${RAW_NAME}" >> $GITHUB_ENV
           echo "ORIG_SIZE=$(stat -c%s "work/input_${RAW_NAME}")" >> $GITHUB_ENV
-          echo "--- 元のキーフレーム数 ---"
-          ffprobe -v error -select_streams v:0 -show_entries frame=key_frame -of csv=p=0 "work/input_${RAW_NAME}" | grep -c "^1" || true
+          echo "--- 元のキーフレーム数 (packetで高速・数秒で終わる) ---"
+          timeout 60 ffprobe -v error -select_streams v:0 -show_entries packet=flags -of csv=p=0 "work/input_${RAW_NAME}" | grep -c "K" || echo "count failed, continue"
       - name: Decide output
         env:
           OUTPUT_NAME_INPUT: ${{ inputs.output_name }}
@@ -121,8 +121,8 @@ jobs:
           echo "ENCODE_SECONDS=$((END-START))" >> $GITHUB_ENV
           echo "Encode took $((END-START))s"
           ls -lh work/
-          echo "--- 変換後キーフレーム数 (元と同じはず) ---"
-          ffprobe -v error -select_streams v:0 -show_entries frame=key_frame -of csv=p=0 "$OUTPUT_FILE" | grep -c "^1" || true
+          echo "--- 変換後キーフレーム数 (packetで高速) ---"
+          timeout 60 ffprobe -v error -select_streams v:0 -show_entries packet=flags -of csv=p=0 "$OUTPUT_FILE" | grep -c "K" || echo "count failed"
           NEW_SIZE=$(stat -c%s "$OUTPUT_FILE")
           echo "NEW_SIZE=$NEW_SIZE" >> $GITHUB_ENV
           RATIO=$(echo "scale=2; $NEW_SIZE * 100 / $ORIG_SIZE" | bc)
