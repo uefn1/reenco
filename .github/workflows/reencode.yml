@@ -7,7 +7,7 @@ on:
         required: true
         type: string
       output_name:
-        description: '出力ファイル名 (拡張子なし / 空なら自動)'
+        description: '出力ファイル名 (拡張子なし / 空なら自動、拡張子は入力と同じになる)'
         required: false
         type: string
         default: ''
@@ -17,8 +17,14 @@ on:
         type: choice
         default: 'hevc'
         options: [hevc, av1, h264, copy]
+      crf_mode:
+        description: 'CRFモード custom=下のcrfを使う / same=元のCRFと同じにする (検出できなければ既定値)'
+        required: false
+        type: choice
+        default: 'custom'
+        options: [custom, same]
       crf:
-        description: 'CRF hevc:18-28 av1:28-35 h264:18-23'
+        description: 'CRF custom時 hevc:18-28 av1:28-35 h264:18-23 / same時は無視'
         required: false
         type: string
         default: '22'
@@ -88,21 +94,27 @@ jobs:
           echo "ORIG_SIZE=$(stat -c%s "work/input_${RAW_NAME}")" >> $GITHUB_ENV
           echo "--- 元のキーフレーム数 (packetで高速・数秒で終わる) ---"
           timeout 60 ffprobe -v error -select_streams v:0 -show_entries packet=flags -of csv=p=0 "work/input_${RAW_NAME}" | grep -c "K" || echo "count failed, continue"
-      - name: Decide output
+      - name: Decide output (拡張子 = 入力と同じ)
         env:
           OUTPUT_NAME_INPUT: ${{ inputs.output_name }}
           RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
+          if [[ "$RAW_NAME" == *.* ]]; then EXT="${RAW_NAME##*.}"; EXT=$(echo "$EXT" | tr 'A-Z' 'a-z'); else EXT="mp4"; fi
+          case "$EXT" in mkv|mp4|m4v|mov|webm|avi) ;; *) EXT="mp4" ;; esac
+          echo "OUTPUT_EXT=$EXT" >> $GITHUB_ENV
+          echo "Input ext: $EXT"
           if [ -n "$OUTPUT_NAME_INPUT" ]; then BASE=$(basename "$OUTPUT_NAME_INPUT"); BASE="${BASE%.*}"; else BASE="${RAW_NAME%.*}"; BASE=$(echo "$BASE" | tr ' ' '_' | tr -cd 'a-zA-Z0-9._-'); if [ -z "$BASE" ]; then BASE="video"; fi; fi
           echo "BASE_NAME=$BASE" >> $GITHUB_ENV
-          echo "OUTPUT_FILE=work/${BASE}_reencoded.mp4" >> $GITHUB_ENV
+          echo "OUTPUT_FILE=work/${BASE}_reencoded.${EXT}" >> $GITHUB_ENV
+          echo "Output: work/${BASE}_reencoded.${EXT} (入力と同じ拡張子)"
           if [ -n "$RELEASE_TAG_INPUT" ]; then TAG="$RELEASE_TAG_INPUT"; else TAG="v$(date -u +%Y%m%d-%H%M%S)"; fi
           echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
       - name: Re-encode (キーフレーム増加なし)
         env:
           CODEC: ${{ inputs.codec }}
-          CRF: ${{ inputs.crf }}
+          CRF_INPUT: ${{ inputs.crf }}
+          CRF_MODE: ${{ inputs.crf_mode }}
           PRESET: ${{ inputs.preset }}
           SPEED_MODE: ${{ inputs.speed_mode }}
           PARALLEL_CHUNKS: ${{ inputs.parallel_chunks }}
@@ -110,12 +122,28 @@ jobs:
         run: |
           set -euo pipefail
           START=$(date +%s)
+          # CRFを決める: same なら元のCRFを検出、custom なら入力値
+          if [ "$CRF_MODE" = "same" ] && [ "$CODEC" != "copy" ]; then
+            echo "=== CRFモード: same (元のCRFと同じにする) ==="
+            EFFECTIVE_CRF=$(python3 scripts/get_crf.py "$INPUT_FILE" "$CODEC" || echo "")
+            if [ -z "$EFFECTIVE_CRF" ]; then
+              case "$CODEC" in hevc) EFFECTIVE_CRF=22;; av1) EFFECTIVE_CRF=30;; h264) EFFECTIVE_CRF=22;; *) EFFECTIVE_CRF="$CRF_INPUT";; esac
+              echo "元のCRFが検出できなかった -> 既定値 $EFFECTIVE_CRF を使う"
+            else
+              echo "元のCRFを検出: $EFFECTIVE_CRF -> そのまま使う"
+            fi
+          else
+            EFFECTIVE_CRF="$CRF_INPUT"
+            echo "=== CRFモード: custom CRF=$EFFECTIVE_CRF ==="
+          fi
+          echo "EFFECTIVE_CRF=$EFFECTIVE_CRF" >> $GITHUB_ENV
+          echo "Effective CRF: $EFFECTIVE_CRF (mode=$CRF_MODE codec=$CODEC)"
           if [ "$SPEED_MODE" = "fast" ] && [ "$CODEC" != "copy" ]; then
             echo "=== FAST: キーフレーム位置維持で分割並列 ==="
-            bash scripts/reencode_parallel.sh "$INPUT_FILE" "$OUTPUT_FILE" "$CODEC" "$CRF" "$PRESET" "$PARALLEL_CHUNKS" "$CHUNK_SECONDS"
+            bash scripts/reencode_parallel.sh "$INPUT_FILE" "$OUTPUT_FILE" "$CODEC" "$EFFECTIVE_CRF" "$PRESET" "$PARALLEL_CHUNKS" "$CHUNK_SECONDS"
           else
             echo "=== STANDARD: 1本 (キーフレーム位置維持) ==="
-            bash scripts/reencode.sh "$INPUT_FILE" "$OUTPUT_FILE" "$CODEC" "$CRF" "$PRESET"
+            bash scripts/reencode.sh "$INPUT_FILE" "$OUTPUT_FILE" "$CODEC" "$EFFECTIVE_CRF" "$PRESET"
           fi
           END=$(date +%s)
           echo "ENCODE_SECONDS=$((END-START))" >> $GITHUB_ENV
@@ -129,7 +157,8 @@ jobs:
           {
             echo "### 結果"
             echo "- 元: $(numfmt --to=iec $ORIG_SIZE) -> 後: $(numfmt --to=iec $NEW_SIZE) (${RATIO}%)"
-            echo "- codec: $CODEC CRF:$CRF preset:$PRESET mode:$SPEED_MODE"
+            echo "- codec: $CODEC CRF:$EFFECTIVE_CRF (mode:$CRF_MODE) preset:$PRESET mode:$SPEED_MODE"
+            echo "- 出力: $OUTPUT_FILE (入力と同じ拡張子)"
             echo "- 時間: $((END-START))秒 / キーフレーム増加なし"
           } >> $GITHUB_STEP_SUMMARY
       - name: Split 1.9GiB
@@ -153,12 +182,13 @@ jobs:
           cat > ../release_notes.md <<EOF
           ## 動画再エンコード
           - 元URL: $VIDEO_URL
-          - 変換: ${{ inputs.codec }} / CRF ${{ inputs.crf }} / preset ${{ inputs.preset }} / mode ${{ inputs.speed_mode }}
+          - 変換: ${{ inputs.codec }} / CRF ${EFFECTIVE_CRF} (mode ${{ inputs.crf_mode }}) / preset ${{ inputs.preset }} / mode ${{ inputs.speed_mode }}
           - 元: $(numfmt --to=iec $ORIG_SIZE) -> 後: $(numfmt --to=iec $NEW_SIZE)
           - 時間: ${ENCODE_SECONDS}秒
+          - 出力: $OUTPUT_FILE (入力と同じ拡張子)
           - キーフレーム: 元の位置を維持 (増加なし) / 分割: 1.9GiBごと
           ### 復元
-          cat *.part > video.mp4
+          cat *.part > video.mkv
           sha256sum -c checksums.txt
           EOF
           gh release create "$RELEASE_TAG" --title "$RELEASE_TAG - $BASE_NAME" --notes-file ../release_notes.md $(cat ../upload_list.txt)
