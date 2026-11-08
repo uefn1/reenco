@@ -1,0 +1,167 @@
+name: Video Re-encode & Release
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: '動画の直URL'
+        required: true
+        type: string
+      output_name:
+        description: '出力ファイル名 (拡張子なし / 空なら自動)'
+        required: false
+        type: string
+        default: ''
+      codec:
+        description: 'コーデック'
+        required: false
+        type: choice
+        default: 'hevc'
+        options: [hevc, av1, h264, copy]
+      crf:
+        description: 'CRF hevc:18-28 av1:28-35 h264:18-23'
+        required: false
+        type: string
+        default: '22'
+      preset:
+        description: 'プリセット'
+        required: false
+        type: choice
+        default: 'slow'
+        options: [ultrafast, veryfast, fast, medium, slow, veryslow]
+      speed_mode:
+        description: 'fast=分割並列 (キーフレーム増加なし) / standard=1本'
+        required: false
+        type: choice
+        default: 'fast'
+        options: [fast, standard]
+      parallel_chunks:
+        description: '並列数 auto=CPU数 / 2,4,8'
+        required: false
+        type: string
+        default: 'auto'
+      chunk_seconds:
+        description: '1チャンクの目安(秒) 600=10分、キーフレーム位置で調整される'
+        required: false
+        type: string
+        default: '600'
+      runner:
+        description: 'ランナー'
+        required: false
+        type: choice
+        default: 'ubuntu-latest'
+        options: [ubuntu-latest, ubuntu-latest-8-cores, ubuntu-latest-16-cores]
+      release_tag:
+        description: 'Releaseタグ (空なら自動)'
+        required: false
+        type: string
+        default: ''
+permissions:
+  contents: write
+jobs:
+  reencode:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg + aria2
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg bc curl aria2 jq
+          echo "CPU: $(nproc) cores"
+          ffmpeg -version | head -n 1
+          df -h
+      - name: Download (aria2 16分割)
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          RAW_NAME=$(basename "${VIDEO_URL%%\?*}")
+          RAW_NAME=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "$RAW_NAME")
+          if [ -z "$RAW_NAME" ] || [ "$RAW_NAME" = "/" ] || [[ "$RAW_NAME" != *.* ]]; then RAW_NAME="input.mp4"; fi
+          echo "RAW_NAME=$RAW_NAME" >> $GITHUB_ENV
+          if ! aria2c -x 16 -s 16 -k 1M --retry-wait=5 --max-tries=3 --allow-overwrite=true -d work -o "input_${RAW_NAME}" "$VIDEO_URL"; then
+            curl -L --fail --retry 3 -o "work/input_${RAW_NAME}" "$VIDEO_URL"
+          fi
+          ls -lh work/
+          echo "INPUT_FILE=work/input_${RAW_NAME}" >> $GITHUB_ENV
+          echo "ORIG_SIZE=$(stat -c%s "work/input_${RAW_NAME}")" >> $GITHUB_ENV
+          echo "--- 元のキーフレーム数 ---"
+          ffprobe -v error -select_streams v:0 -show_entries frame=key_frame -of csv=p=0 "work/input_${RAW_NAME}" | grep -c "^1" || true
+      - name: Decide output
+        env:
+          OUTPUT_NAME_INPUT: ${{ inputs.output_name }}
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$OUTPUT_NAME_INPUT" ]; then BASE=$(basename "$OUTPUT_NAME_INPUT"); BASE="${BASE%.*}"; else BASE="${RAW_NAME%.*}"; BASE=$(echo "$BASE" | tr ' ' '_' | tr -cd 'a-zA-Z0-9._-'); if [ -z "$BASE" ]; then BASE="video"; fi; fi
+          echo "BASE_NAME=$BASE" >> $GITHUB_ENV
+          echo "OUTPUT_FILE=work/${BASE}_reencoded.mp4" >> $GITHUB_ENV
+          if [ -n "$RELEASE_TAG_INPUT" ]; then TAG="$RELEASE_TAG_INPUT"; else TAG="v$(date -u +%Y%m%d-%H%M%S)"; fi
+          echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
+      - name: Re-encode (キーフレーム増加なし)
+        env:
+          CODEC: ${{ inputs.codec }}
+          CRF: ${{ inputs.crf }}
+          PRESET: ${{ inputs.preset }}
+          SPEED_MODE: ${{ inputs.speed_mode }}
+          PARALLEL_CHUNKS: ${{ inputs.parallel_chunks }}
+          CHUNK_SECONDS: ${{ inputs.chunk_seconds }}
+        run: |
+          set -euo pipefail
+          START=$(date +%s)
+          if [ "$SPEED_MODE" = "fast" ] && [ "$CODEC" != "copy" ]; then
+            echo "=== FAST: キーフレーム位置維持で分割並列 ==="
+            bash scripts/reencode_parallel.sh "$INPUT_FILE" "$OUTPUT_FILE" "$CODEC" "$CRF" "$PRESET" "$PARALLEL_CHUNKS" "$CHUNK_SECONDS"
+          else
+            echo "=== STANDARD: 1本 (キーフレーム位置維持) ==="
+            bash scripts/reencode.sh "$INPUT_FILE" "$OUTPUT_FILE" "$CODEC" "$CRF" "$PRESET"
+          fi
+          END=$(date +%s)
+          echo "ENCODE_SECONDS=$((END-START))" >> $GITHUB_ENV
+          echo "Encode took $((END-START))s"
+          ls -lh work/
+          echo "--- 変換後キーフレーム数 (元と同じはず) ---"
+          ffprobe -v error -select_streams v:0 -show_entries frame=key_frame -of csv=p=0 "$OUTPUT_FILE" | grep -c "^1" || true
+          NEW_SIZE=$(stat -c%s "$OUTPUT_FILE")
+          echo "NEW_SIZE=$NEW_SIZE" >> $GITHUB_ENV
+          RATIO=$(echo "scale=2; $NEW_SIZE * 100 / $ORIG_SIZE" | bc)
+          {
+            echo "### 結果"
+            echo "- 元: $(numfmt --to=iec $ORIG_SIZE) -> 後: $(numfmt --to=iec $NEW_SIZE) (${RATIO}%)"
+            echo "- codec: $CODEC CRF:$CRF preset:$PRESET mode:$SPEED_MODE"
+            echo "- 時間: $((END-START))秒 / キーフレーム増加なし"
+          } >> $GITHUB_STEP_SUMMARY
+      - name: Split 1.9GiB
+        run: |
+          set -euo pipefail
+          cd work
+          OUT=$(basename "$OUTPUT_FILE")
+          SIZE=$(stat -c%s "$OUT")
+          LIMIT=$((1900 * 1024 * 1024))
+          if [ "$SIZE" -gt "$LIMIT" ]; then split -b 1900M -d --additional-suffix=.part "$OUT" "${OUT}."; rm "$OUT"; else echo "No split needed"; fi
+          ls -lh
+          sha256sum * > checksums.txt || true
+          ls -1 > ../upload_list.txt
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          set -euo pipefail
+          cd work
+          cat > ../release_notes.md <<EOF
+          ## 動画再エンコード
+          - 元URL: $VIDEO_URL
+          - 変換: ${{ inputs.codec }} / CRF ${{ inputs.crf }} / preset ${{ inputs.preset }} / mode ${{ inputs.speed_mode }}
+          - 元: $(numfmt --to=iec $ORIG_SIZE) -> 後: $(numfmt --to=iec $NEW_SIZE)
+          - 時間: ${ENCODE_SECONDS}秒
+          - キーフレーム: 元の位置を維持 (増加なし) / 分割: 1.9GiBごと
+          ### 復元
+          cat *.part > video.mp4
+          sha256sum -c checksums.txt
+          EOF
+          gh release create "$RELEASE_TAG" --title "$RELEASE_TAG - $BASE_NAME" --notes-file ../release_notes.md $(cat ../upload_list.txt)
+      - name: Cleanup
+        if: always()
+        run: rm -rf work || true
